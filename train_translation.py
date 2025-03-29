@@ -16,6 +16,8 @@ from PIL import Image
 from metrics import evaluate_image_quality
 import argparse
 import wandb
+import torchvision
+from utils import shuffle_images_identically
 
 # Add imports for DDP
 import torch.distributed as dist
@@ -39,9 +41,13 @@ def parse_args():
                         help="Size to resize images to (default: 64).")
     parser.add_argument("--data_path", type=str, default='/ix3/tibrahim/jil202/11-motion-correction/ldm/crc_brain_controlnet/qcdata/t1',
                         help="Path to the dataset directory.")
+    parser.add_argument("--inf_path", type=str, default='/ix3/tibrahim/jil202/11-motion-correction/ldm/mri_translation/t1-tse/data/t1',
+                        help="Path to the inference dataset directory.")
+    parser.add_argument("--progressive", action="store_true",
+                        help="Use progressive patch shuffling for training.")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for training (default: 32).")
-    parser.add_argument("--max_epochs", type=int, default=1000,
+    parser.add_argument("--max_epochs", type=int, default=100,
                         help="Maximum number of training epochs (default: 1000).")
     parser.add_argument("--sample", type=int, default=100,
                         help="Maximum number of training epochs (default: 1000).")
@@ -224,10 +230,29 @@ def train(local_rank, args):
             rank=local_rank,
             world_size=args.world_size
         )
+
+        inf_loader, _ = getloader(
+            batch_size=args.batch_size,
+            data_root=args.inf_path,
+            crop_size=args.crop_size,
+            size=args.resize_size,
+            sample=args.sample,
+            type='img',
+            distributed=True,
+            rank=local_rank,
+            world_size=args.world_size
+        )
     else:
         train_loader, val_loader = getloader(
             batch_size=args.batch_size,
             data_root=args.data_path,
+            crop_size=args.crop_size,
+            size=args.resize_size,
+            sample=args.sample
+        )
+        inf_loader, _ = getloader(
+            batch_size=args.batch_size,
+            data_root=args.inf_path,
             crop_size=args.crop_size,
             size=args.resize_size,
             sample=args.sample
@@ -299,6 +324,21 @@ def train(local_rank, args):
 
         for _step, (t1w, tse) in progress_bar:
             t1w, tse = t1w.to(device).unsqueeze(1), tse.to(device).unsqueeze(1)
+            if args.progressive:
+                if epoch >= 0 and epoch < 40:
+                    t1w, tse = shuffle_images_identically(t1w, tse, num_patches=2)
+                elif epoch >= 40 and epoch < 60:
+                    t1w, tse = shuffle_images_identically(t1w, tse, num_patches=3)
+                elif epoch >= 60:
+                    t1w, tse = shuffle_images_identically(t1w, tse, num_patches=4)
+
+            plt.imshow(t1w.cpu()[0].squeeze().numpy(), cmap='gray')
+            plt.savefig('t1w.png')
+            plt.close()
+            plt.imshow(tse.cpu()[0].squeeze().numpy(), cmap='gray')
+            plt.savefig('t2w.png')
+            plt.close()
+
             optimizer.zero_grad(set_to_none=True)
             timesteps = torch.randint(0, 1000, (t1w.shape[0],)).to(device)
 
@@ -334,7 +374,7 @@ def train(local_rank, args):
             model.eval()
             val_epoch_loss = 0
             with torch.no_grad():
-                for t1w, tse in val_loader:
+                for t1w, tse in inf_loader:
                     t1w, tse = t1w.to(device).unsqueeze(1), tse.to(device).unsqueeze(1)
                     timesteps = torch.randint(0, 1000, (t1w.shape[0],)).to(device)
                     with autocast(enabled=True):
@@ -369,7 +409,7 @@ def train(local_rank, args):
             # Save best model on main process
             if local_rank == 0 and ssim > best_ssim:
                 best_ssim = ssim
-                checkpoint_path = f"./checkpoints/{args.resize_size}/t1w_to_tse_model_{args.resize_size}_ssim_{best_ssim:.2f}.pt"
+                checkpoint_path = f"./checkpoints/{args.resize_size}/t1w_to_tse_model_{args.resize_size}_ssim_{best_ssim:.2f}_progressive_patch.pt"
                 
                 # Save the model state dict (unwrap DDP model if needed)
                 if args.distributed:

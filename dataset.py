@@ -71,7 +71,7 @@ def get_dataset(data_root, crop_size, size, sample=1, type='img'):
     generator = torch.Generator().manual_seed(42)
     train_set, val_set = torch.utils.data.random_split(
         dataset, 
-        [int(len(dataset)*0.8), len(dataset)-int(len(dataset)*0.8)],
+        [int(len(dataset)*0.95), len(dataset)-int(len(dataset)*0.95)],
         generator=generator
     )
     
