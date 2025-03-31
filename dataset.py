@@ -24,7 +24,7 @@ class tseDataset(Dataset):
 
     def __getitem__(self, index):
         t1_path = self.image_paths[index]
-        tse_path = self.image_paths[index].replace('/t1/','/tse/').replace('_t1-','_tse-')
+        tse_path = self.image_paths[index].replace('/t1/','/tse/')
         if self.type == 'img':
             t1_image = Image.open(t1_path)
             t1_image = torch.tensor(np.array(t1_image)).unsqueeze(0).unsqueeze(-1)
@@ -47,7 +47,7 @@ class tseDataset(Dataset):
             
             return t1_latent, tse_latent
 
-def get_dataset(data_root, crop_size, size, sample=1, type='img'):
+def get_dataset(data_root, crop_size, size, sample=1, type='img', split_ratio=0.95):
     """Create and return the dataset without creating DataLoader"""
     target_shape = (crop_size, crop_size, 1)
     resize_transform = tio.CropOrPad(target_shape)
@@ -71,15 +71,15 @@ def get_dataset(data_root, crop_size, size, sample=1, type='img'):
     generator = torch.Generator().manual_seed(42)
     train_set, val_set = torch.utils.data.random_split(
         dataset, 
-        [int(len(dataset)*0.95), len(dataset)-int(len(dataset)*0.95)],
+        [int(len(dataset)*split_ratio), len(dataset)-int(len(dataset)*split_ratio)],
         generator=generator
     )
     
     return train_set, val_set
 
-def getloader(batch_size, data_root, crop_size, size, sample=1, type='img', distributed=False, rank=0, world_size=1):
+def getloader(batch_size, data_root, crop_size, size, sample=1, type='img', distributed=False, rank=0, world_size=1, split_ratio=0.95, train_shuffle=True):
     """Create and return dataloaders with optional distributed training support"""
-    train_set, val_set = get_dataset(data_root, crop_size, size, sample, type)
+    train_set, val_set = get_dataset(data_root, crop_size, size, sample, type, split_ratio)
     
     if distributed:
         # Create distributed samplers
@@ -87,7 +87,7 @@ def getloader(batch_size, data_root, crop_size, size, sample=1, type='img', dist
             train_set,
             num_replicas=world_size,
             rank=rank,
-            shuffle=True,
+            shuffle=train_shuffle,
             seed=42  # Fixed seed for reproducibility
         )
         
@@ -122,7 +122,7 @@ def getloader(batch_size, data_root, crop_size, size, sample=1, type='img', dist
         train_loader = DataLoader(
             train_set, 
             batch_size=batch_size, 
-            shuffle=True, 
+            shuffle=train_shuffle, 
             num_workers=8,
             pin_memory=True
         )
