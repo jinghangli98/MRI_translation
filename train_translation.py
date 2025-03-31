@@ -39,12 +39,18 @@ def parse_args():
                         help="Size to crop images to (default: 448).")
     parser.add_argument("--resize_size", type=int, default=64,
                         help="Size to resize images to (default: 64).")
-    parser.add_argument("--data_path", type=str, default='/ix3/tibrahim/jil202/11-motion-correction/ldm/crc_brain_controlnet/qcdata/t1',
+    parser.add_argument("--data_path", type=str, default='/ix3/tibrahim/jil202/11-motion-correction/ldm/mri_translation/t1-tse/training_data/t1',
                         help="Path to the dataset directory.")
     parser.add_argument("--inf_path", type=str, default='/ix3/tibrahim/jil202/11-motion-correction/ldm/mri_translation/t1-tse/data/t1',
                         help="Path to the inference dataset directory.")
     parser.add_argument("--progressive", action="store_true",
-                        help="Use progressive patch shuffling for training.")
+                        help="Use progressive patch shuffling for training.") #processive patch shuffling for training doesn't seem to help
+    parser.add_argument("--save_model", action="store_true",
+                        help="flag to save diffusion model checkpoints") 
+    parser.add_argument("--progressive_inference", action="store_true",
+                        help="progressive_inference") 
+    parser.add_argument("--noise_level", type=float, default=0.7,
+                        help="progressive inference noise level, 0.0 to 1.0 0.0 means starting from pure noise, 1.0 means starting from the original image") 
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for training (default: 32).")
     parser.add_argument("--max_epochs", type=int, default=100,
@@ -105,44 +111,61 @@ def visualize_and_save(epoch, model, device, scheduler, t1w, tse, args, local_ra
         metricses = []
         for ind in range(args.eval_num):
             input_img = t1w[ind:ind+1]
-            noise = torch.randn_like(input_img).to(device)
-            current_img = noise  # for the TSE image, we start from random noise.
-            combined = torch.cat(
-                (input_img, noise), dim=1
-            )  # We concatenate the input T1w MR image to add anatomical information.
-
             scheduler.set_timesteps(num_inference_steps=1000)
-            progress_bar = tqdm(scheduler.timesteps, desc=f"Generating TSE (Epoch {epoch+1})")
-            chain = torch.zeros(current_img.shape)
-            for t in progress_bar:  # go through the noising process
-                with autocast(enabled=False):
-                    # Unwrap DDP model for inference if needed
-                    if isinstance(model, DDP):
-                        model_output = model.module(combined, timesteps=torch.Tensor((t,)).to(current_img.device))
-                    else:
-                        model_output = model(combined, timesteps=torch.Tensor((t,)).to(current_img.device))
-                        
-                    current_img, _ = scheduler.step(
-                        model_output, t, current_img
-                    )  # this is the prediction x_t at the time step t
-                    if t % 100 == 0 and t > 0:
-                        chain = torch.cat((chain, current_img.cpu()), dim=-1)
-                    combined = torch.cat(
-                        (input_img, current_img),
-                        dim=1,
-                        # in every step during the denoising process
-                        # the T1w MR image is concatenated to add anatomical information
-                    )
+
+            if args.progressive_inference:
+                current_img = tse[ind:ind+1]
+                noise_timestep = int(args.noise_level * len(scheduler.timesteps))
+                noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
+                noise = torch.randn_like(current_img, device=device)
+                t = scheduler.timesteps[noise_timestep]
+
+                alpha_cumprod = scheduler.alphas_cumprod.to(device)
+                sqrt_alpha_t = alpha_cumprod[t] ** 0.5
+                sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
+                current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
+                
+                starting_timestep_idx = noise_timestep
+
+                timesteps = scheduler.timesteps[starting_timestep_idx:]
+                progress_bar = tqdm(timesteps, desc=f"Generating TSE Starting with Existing TSE (Epoch {epoch+1})")
+                for t in progress_bar:
+                    combined = torch.cat((input_img, current_img), dim=1)
+                    model_output = model(combined, timesteps=torch.Tensor((t,)).to(device))
+                    current_img, _ = scheduler.step(model_output, t, current_img)
+                    combined = torch.cat((input_img, current_img), dim=1)
+
+            else:
+                noise = torch.randn_like(input_img).to(device)
+                current_img = noise  # for the TSE image, we start from random noise.
+                combined = torch.cat(
+                    (input_img, noise), dim=1 # We concatenate the input T1w MR image to add anatomical information.
+                )  
+
+                progress_bar = tqdm(scheduler.timesteps, desc=f"Generating TSE (Epoch {epoch+1})")
+
+                for t in progress_bar:  # go through the noising process
+                    with autocast(enabled=False):
+                        # Unwrap DDP model for inference if needed
+                        if isinstance(model, DDP):
+                            model_output = model.module(combined, timesteps=torch.Tensor((t,)).to(current_img.device))
+                        else:
+                            model_output = model(combined, timesteps=torch.Tensor((t,)).to(current_img.device))
+                            
+                        current_img, _ = scheduler.step(
+                            model_output, t, current_img
+                        )  # this is the prediction x_t at the time step t
+                        combined = torch.cat((input_img, current_img), dim=1,) # in every step during the denoising process, the T1w MR image is concatenated to add anatomical information
             metrics = evaluate_image_quality(current_img.cpu().squeeze().numpy(), tse[ind].cpu().squeeze().numpy())
             metricses.append(metrics)
 
-        vis = torch.hstack((norm(input_img.squeeze().cpu()), norm(current_img.squeeze().cpu()), norm(tse[ind].squeeze().cpu())))
-        vis = vis.numpy().astype(np.uint8)
-        vis = Image.fromarray(vis)
-        vis.save(f"visualization_results/epoch_{epoch+1}.png")
+            vis = torch.hstack((norm(input_img.squeeze().cpu()), norm(current_img.squeeze().cpu()), norm(tse[ind].squeeze().cpu())))
+            vis = vis.numpy().astype(np.uint8)
+            vis = Image.fromarray(vis)
+            vis.save(f"visualization_results/epoch_{epoch+1}_{ind}.png")
         
     if args.log and local_rank == 0:
-        wandb.log({"Generated Image": wandb.Image(vis), **metrics}, step=epoch)
+        wandb.log({"Generated Image": wandb.Image(vis), **metrics, **args}, step=epoch)
 
     return np.array([metric['SSIM'] for metric in metricses]).mean(), np.array([metric['PSNR'] for metric in metricses]).mean(), np.array([metric['LPIPS'] for metric in metricses]).mean()
 
@@ -201,16 +224,7 @@ def train(local_rank, args):
     
     # Initialize wandb only on main process
     if args.log and local_rank == 0:
-        wandb.init(project="T1TSE_Translation", config={
-            "learning_rate": args.lr,
-            "batch_size": args.batch_size,
-            "max_epochs": args.max_epochs,
-            "val_interval": args.val_interval,
-            "model": "DiffusionModelUNet",
-            "dataset": "CRC Brain ControlNet",
-            "distributed": args.distributed,
-            "world_size": args.world_size
-        })
+        wandb.init(project="T1TSE_Translation", config=vars(args)) 
     
     # Create output directories on main process
     if local_rank == 0:
@@ -232,15 +246,16 @@ def train(local_rank, args):
         )
 
         inf_loader, _ = getloader(
-            batch_size=args.batch_size,
+            batch_size=16,
             data_root=args.inf_path,
             crop_size=args.crop_size,
             size=args.resize_size,
-            sample=args.sample,
+            sample=100,
             type='img',
             distributed=True,
             rank=local_rank,
-            world_size=args.world_size
+            world_size=args.world_size,
+            train_shuffle=False
         )
     else:
         train_loader, val_loader = getloader(
@@ -250,13 +265,7 @@ def train(local_rank, args):
             size=args.resize_size,
             sample=args.sample
         )
-        inf_loader, _ = getloader(
-            batch_size=args.batch_size,
-            data_root=args.inf_path,
-            crop_size=args.crop_size,
-            size=args.resize_size,
-            sample=args.sample
-        )
+        inf_loader, _ = getloader(batch_size=16, data_root=args.inf_path, crop_size=args.crop_size, size=args.resize_size, sample=100, train_shuffle=False)
     
     if local_rank == 0:
         print(f"Data loaders created, train: {len(train_loader)}, val: {len(val_loader)}")
@@ -409,13 +418,14 @@ def train(local_rank, args):
             # Save best model on main process
             if local_rank == 0 and ssim > best_ssim:
                 best_ssim = ssim
-                checkpoint_path = f"./checkpoints/{args.resize_size}/t1w_to_tse_model_{args.resize_size}_ssim_{best_ssim:.2f}_progressive_patch.pt"
+                checkpoint_path = f"./checkpoints/{args.resize_size}/t1w_to_tse_model_{args.resize_size}_ssim_{best_ssim:.2f}.pt"
                 
                 # Save the model state dict (unwrap DDP model if needed)
-                if args.distributed:
-                    torch.save(model.module.state_dict(), checkpoint_path)
-                else:
-                    torch.save(model.state_dict(), checkpoint_path)
+                if args.save_model:
+                    if args.distributed:
+                        torch.save(model.module.state_dict(), checkpoint_path)
+                    else:
+                        torch.save(model.state_dict(), checkpoint_path)
                     
                 print(f"Saved best model with SSIM: {best_ssim:.4f}")
 
